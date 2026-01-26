@@ -1,0 +1,5 @@
+gspread
+oauth2client
+google-analytics-data
+pymysql
+psycopg2-binary

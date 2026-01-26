@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local secrets / config
+local_settings.py
+.env
+.env.*
+service_account.json
+bbibbi-7b3ee-038c72f71c2a.json
+beep-5f601-9433bd407866.json
+
+# Virtualenv
+venv/
+.venv/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor/OS
+.idea/
+.vscode/
+.python-version
+*.log
