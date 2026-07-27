@@ -59,8 +59,10 @@ python main.py --start 20240101 --end 20240131
 기본 시트 이름은 다음과 같습니다 (필요 시 `main.py` 상단에서 변경).
 
 - 데이터 입력: `데이터입력시트`
-- 그래프 데이터: `그래프_데이터`
+- 그래프 데이터: `그래프_데이터` (B열 날짜, C~AT열 복사)
+- 모바일 그래프 데이터: `모바일_그래프_데이터` (B열 날짜, C~K열 복사)
 - 보고 양식: `평일보고양식`
+- 모바일 보고 양식: `모바일보고양식` (좌 D~E 2일, 우 M~O 3일 / 모두 당일까지)
 
 ## 수동 점검 스크립트
 
@@ -69,4 +71,7 @@ python test/test_db.py       # DB 연결/기본 쿼리 점검
 python test/test_queries.py  # 쿼리 결과 샘플 확인
 python test/test_sheet.py    # Google Sheets 연결 확인
 python test/ga4_test.py      # GA4 API 연결 확인
+python test/test_graph_row.py      # 그래프 행 추가 로직 점검 (외부 접속 불필요)
+python test/test_mobile_report.py  # 모바일보고양식 셀 계산 점검 (외부 접속 불필요)
+python test/test_mobile_live.py    # 모바일 시트 2개만 실제 시트 상대로 점검 (기본 dry-run)
 ```
