@@ -13,7 +13,8 @@ import traceback
 # [GA4 라이브러리]
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
-    RunReportRequest, DateRange, Metric, Dimension
+    RunReportRequest, DateRange, Metric, Dimension,
+    Filter, FilterExpression, FilterExpressionList,
 )
 
 from settings import (
@@ -32,11 +33,26 @@ from settings import (
 # [0]: Arreo(445891939), [1]: 015(444980831)
 GA4_WEB_IDS = ['445891939', '444980831'] 
 GA4_APP_ID = '461784274'
+# 015 웹 MAU(Y열)를 읽는 속성
+GA4_MAU_WEB_IDS = ['444980831']
+# 기본(어제) 실행 때, 그보다 앞선 며칠의 GA4 열을 다시 읽어 덮어쓴다.
+# GA4 하루 치가 확정되는 데 24~48시간이 걸리기 때문. 0이면 재수집 안 함.
+GA_REFRESH_DAYS = 2
+GA_PAGE_SIZE = 10000   # run_report 한 번에 받는 행 수
+# GA4 조회가 일부 실패해 빈칸으로 들어간 날짜 (종료 코드 판단용)
+GA_INCOMPLETE_DATES = []
+# 세션 출처에 아래 문자열이 들어간 방문은 웹 사용자 수에서 뺀다 (봇·추천 스팸).
+#   예) 2026-09-01 a015.com 방문자 440명 중 408명이 trafficheap.cc 추천 유입(세이셸, 새벽 0~4시)
+GA_EXCLUDE_SOURCES = ['trafficheap']
+# 출처 제외 필터가 거부되어 제외 없이 집계한 지표 (실행 로그용)
+GA_FILTER_FALLBACKS = set()
+# 웹 로그인 이벤트 이름 (호스트별 '웹 로그인(이벤트)' 열)
+GA_WEB_LOGIN_EVENT = 'login'
 
 # [키워드 설정]
 GA_CONFIG = {
     # 1. [웹] URL 키워드
-    'web_signup_keyword': ['join', 'regist', 'signup'],   
+    'web_signup_keyword': ['join', 'regist', 'signup', 'SignUp'],   
     'web_charge_keyword': ['charge', 'payment'],          
     'web_voice_keyword': ['voice', 'vms'],                
     'web_guide_keyword': ['guide', 'help', 'notice'],
@@ -51,8 +67,9 @@ GA_CONFIG = {
     'app_login_event_name': 'login',
     
     # 4. [호스트] 도메인 분류
-    'host_a015': ['a015', 'new.arreo'],   
-    'host_arreo': ['arreo']               
+    'host_a015': ['a015', 'new.arreo'],
+    'host_arreo': ['arreo'],
+    'host_exclude': ['localhost', '127.0.0.1', '192.168', 'confirm.seoultel', 'stage.', 'test-']  # 개발/테스트 환경 제외
 }
 
 # [설정] 시트 이름 정의 (실제 시트 이름과 똑같이 맞춰주세요!)
@@ -208,126 +225,334 @@ def get_hdb_data(target_date):
     except Exception as e: print(f"❌ HDB Error: {e}"); return None
 
 # ==============================================================================
-# [함수] 데이터 수집 - GA4 (집계 기준 수정)
+# [함수] 데이터 수집 - GA4
 # ==============================================================================
+# 집계 원칙
+#   1) "사용자 수"는 더할 수 없는 값이다. 페이지별 행을 받아 합산하면 여러 페이지를 본
+#      한 사람이 여러 명으로 잡힌다. 그래서 키워드 조건은 GA4 필터로 넘기고,
+#      호스트별 고유 사용자 수를 GA4가 계산하게 한다.
+#   2) 같은 호스트가 두 속성에 모두 잡히면(스트림 중복 전송) 더하지 않고 큰 값만 쓴다.
+#   3) 조회에 실패한 항목은 0이 아니라 None(시트에는 빈칸)으로 둔다.
+#      0은 "방문자 없음"으로 읽히기 때문. 빈칸은 다음 실행의 GA4 재수집이 채운다.
+GA_WEB_PAGE_METRICS = [
+    # (결과 키, GA_CONFIG 키워드 키)
+    ('web_signup',  'web_signup_keyword'),
+    ('cash_charge', 'web_charge_keyword'),
+    ('voicemail',   'web_voice_keyword'),
+    ('guide',       'web_guide_keyword'),
+    ('web_login',   'web_login_page_keyword'),
+]
+GA_WEB_KEYS = [k for k, _ in GA_WEB_PAGE_METRICS] + ['a015_user', 'arreo_user', 'mau_015_total']
+GA_APP_KEYS = ['app_signup', 'app_login', 'dau_app', 'mau_app']
+
+# ------------------------------------------------------------------------------
+# 호스트별 분리 집계 (데이터입력시트 AU열부터, 기존 A~AT열은 그대로 둔다)
+# ------------------------------------------------------------------------------
+# 기존 열(P~Y)은 a015 계열 호스트를 합친 값이다. 아래는 같은 지표를 호스트별로 따로 적는다.
+#   (라벨, 호스트에 들어 있어야 하는 문자열)
+GA_HOST_SPLIT = [
+    ('a015.com', 'a015.com'),
+    ('new.arreo.com', 'new.arreo.com'),
+]
+#   (결과 키, 시트 머리글) — 한 호스트가 차지하는 열 순서
+GA_HOST_METRICS = [
+    ('web_signup', '회원가입페이지'), ('cash_charge', '캐쉬충전페이지'), ('web_login', '웹 로그인'),
+    ('voicemail', '음성사서함'), ('guide', '이용가이드'), ('visitors', '방문자'), ('mau', '월 활성사용자'),
+]
+INPUT_BASE_COLUMNS = 46      # A~AT: 기존 레이아웃
+GA_HOST_FIRST_COLUMN = 47    # AU
+
+
+def host_key(label, metric):
+    return f"{metric}@{label}"
+
+
+# 호스트별 세부 지표와 로그인 '횟수'(login 이벤트). 계산해서 결과에는 담지만 시트에는 쓰지 않는다.
+# (test/ga4_preview.py 로 확인 가능. 시트에 넣으려면 GA_HOST_KEYS 뒤에 덧붙인다.)
+GA_LOGIN_EVENT_KEYS = [host_key(label, 'login_event') for label, _ in GA_HOST_SPLIT]
+GA_DETAIL_KEYS = [host_key(label, metric) for label, _ in GA_HOST_SPLIT for metric, _ in GA_HOST_METRICS] \
+    + GA_LOGIN_EVENT_KEYS
+
+# 시트 AU열부터 쓰는 값: 서비스 4곳 × (MAU, DAU)
+#   AU/AV a015.com · AW/AX new.arreo.com · AY/AZ 015앱 · BA/BB arreo.com
+GA_USAGE_GROUPS = ['a015.com', 'new.arreo.com', '015앱', 'arreo.com']
+GA_USAGE_METRICS = [('mau', 'MAU'), ('dau', 'DAU')]
+GA_HOST_KEYS = [host_key(label, metric) for label in GA_USAGE_GROUPS for metric, _ in GA_USAGE_METRICS]
+INPUT_END_COLUMN = INPUT_BASE_COLUMNS + len(GA_HOST_KEYS)   # 54 = BB
+GA_APP_PLATFORMS = ['Android', 'iOS']
+
+
+def _contains_any(field_name, keywords):
+    """field 값에 keywords 중 하나라도 들어 있으면 통과 (대소문자 구분, 기존 `k in value`와 동일)."""
+    return FilterExpression(or_group=FilterExpressionList(expressions=[
+        FilterExpression(filter=Filter(
+            field_name=field_name,
+            string_filter=Filter.StringFilter(
+                match_type=Filter.StringFilter.MatchType.CONTAINS,
+                value=keyword,
+                case_sensitive=True,
+            ),
+        ))
+        for keyword in keywords
+    ]))
+
+
+def _build_filter(contains=None, exclude_sources=None):
+    """contains 조건과 '출처 제외' 조건을 AND로 묶는다. 둘 다 없으면 None."""
+    parts = []
+    if contains:
+        parts.append(_contains_any(*contains))
+    if exclude_sources:
+        parts.append(FilterExpression(not_expression=_contains_any("sessionSource", exclude_sources)))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return FilterExpression(and_group=FilterExpressionList(expressions=parts))
+
+
+def _ga_rows(client, prop, date_fmt, dimensions, metric, contains=None, exclude_sources=None):
+    """하루치 리포트를 끝 페이지까지 읽어 [([차원값...], 정수값), ...] 로 돌려준다.
+
+    contains=(차원이름, [키워드...]) 를 주면 그 차원에 키워드가 포함된 행만 집계한다.
+    exclude_sources=[...] 를 주면 세션 출처에 그 문자열이 들어간 방문을 뺀다.
+    """
+    dimension_filter = _build_filter(contains, exclude_sources)
+    rows, offset = [], 0
+    while True:
+        kwargs = dict(
+            property=prop,
+            date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
+            dimensions=[Dimension(name=d) for d in dimensions],
+            metrics=[Metric(name=metric)],
+            limit=GA_PAGE_SIZE,
+            offset=offset,
+        )
+        if dimension_filter is not None:
+            kwargs["dimension_filter"] = dimension_filter
+        resp = client.run_report(RunReportRequest(**kwargs))
+        for row in resp.rows:
+            rows.append(([v.value for v in row.dimension_values], int(row.metric_values[0].value)))
+        offset += len(resp.rows)
+        if not resp.rows or offset >= resp.row_count:
+            return rows
+
+
+def _web_users_by_host(client, prop, date_fmt, metric="activeUsers", path_keywords=None):
+    """{호스트: 고유 사용자 수}. 개발/테스트 호스트는 뺀다."""
+    contains = ("pagePath", path_keywords) if path_keywords else None
+    args = (client, prop, date_fmt, ["hostName"], metric, contains)
+    if GA_EXCLUDE_SOURCES:
+        try:
+            rows = _ga_rows(*args, exclude_sources=GA_EXCLUDE_SOURCES)
+        except Exception as e:
+            # 지표와 출처 조건을 함께 못 쓰는 경우 등. 값을 비우는 것보다 제외 없이라도 집계한다.
+            # (접속 장애라면 아래 재시도도 실패해 그대로 오류로 올라간다.)
+            rows = _ga_rows(*args)
+            if metric not in GA_FILTER_FALLBACKS:
+                GA_FILTER_FALLBACKS.add(metric)
+                print(f"   ⚠️ 출처 제외 필터 미적용({metric}) — 제외 없이 집계합니다: {str(e)[:200]}")
+    else:
+        rows = _ga_rows(*args)
+
+    out = {}
+    for (host,), cnt in rows:
+        if any(k in host for k in GA_CONFIG['host_exclude']):
+            continue
+        out[host] = out.get(host, 0) + cnt
+    return out
+
+
+def _web_login_events_by_host(client, prop, date_fmt):
+    """{호스트: login 이벤트 횟수}.
+
+    한 사이트의 데이터가 같은 속성의 두 스트림으로 복제 전송되는 경우가 있어
+    (a015 → a015 + 015works), 호스트별로 스트림 중 큰 값 하나만 쓴다.
+    """
+    per_stream = {}
+    for (event_name, host, stream), cnt in _ga_rows(
+            client, prop, date_fmt, ["eventName", "hostName", "streamName"], "eventCount",
+            ("eventName", [GA_WEB_LOGIN_EVENT])):
+        if event_name != GA_WEB_LOGIN_EVENT or any(k in host for k in GA_CONFIG['host_exclude']):
+            continue
+        per_stream[(host, stream)] = per_stream.get((host, stream), 0) + cnt
+    out = {}
+    for (host, _stream), cnt in per_stream.items():
+        out[host] = max(out.get(host, 0), cnt)
+    return out
+
+
+def _merge_max(merged, per_host):
+    """속성 간 병합: 같은 호스트는 큰 값 하나만 남긴다 (중복 전송 이중 집계 방지)."""
+    for host, cnt in per_host.items():
+        merged[host] = max(merged.get(host, 0), cnt)
+
+
+def _is_a015_host(host):
+    return any(k in host for k in GA_CONFIG['host_a015'])
+
+
+def _app_platform_total(rows):
+    return sum(cnt for (platform,), cnt in rows if platform in GA_APP_PLATFORMS)
+
+
 def get_ga4_detailed_data(target_date):
+    """GA4 지표 dict. 조회 실패한 묶음(웹/앱)의 값은 None, 사유는 res['errors']."""
     print(f"📊 GA4 상세 데이터 수집 중... ({target_date})")
-    
+
     date_fmt = f"{target_date[:4]}-{target_date[4:6]}-{target_date[6:]}"
     client = BetaAnalyticsDataClient.from_service_account_json(JSON_KEY_FILE)
-    
-    res = {
-        'web_signup': 0, 'app_signup': 0, 'cash_charge': 0,
-        'web_login': 0, 'app_login': 0,
-        'voicemail': 0, 'guide': 0,
-        'a015_user': 0, 'arreo_user': 0,
-        'mau_015_total': 0,   # Y열 (015 Web + App)
-        'dau_app': 0,         # AK열 (App only)
-        'mau_app': 0          # AL열 (App only)
-    }
-    
-    # 1. WEB 속성들 조회
-    for web_id in GA4_WEB_IDS:
-        try:
+
+    res = {key: None for key in GA_WEB_KEYS + GA_APP_KEYS + GA_DETAIL_KEYS + GA_HOST_KEYS}
+    res['errors'] = []
+
+    # 1. WEB — 한 속성이라도 실패하면 합계를 믿을 수 없으므로 웹 묶음 전체를 비운다.
+    try:
+        visitors = {}
+        login_events = {}
+        login_events_ok = True
+        page_users = {key: {} for key, _ in GA_WEB_PAGE_METRICS}
+        for web_id in GA4_WEB_IDS:
             prop_web = f"properties/{web_id}"
-            
-            # 1-1. 웹 페이지 [사용자 수]
-            req_page = RunReportRequest(
-                property=prop_web,
-                date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-                dimensions=[Dimension(name="pagePath")],
-                metrics=[Metric(name="activeUsers")]  
-            )
-            for row in client.run_report(req_page).rows:
-                path = row.dimension_values[0].value
-                cnt = int(row.metric_values[0].value) 
-                
-                if any(k in path for k in GA_CONFIG['web_signup_keyword']): res['web_signup'] += cnt
-                if any(k in path for k in GA_CONFIG['web_charge_keyword']): res['cash_charge'] += cnt
-                if any(k in path for k in GA_CONFIG['web_voice_keyword']):  res['voicemail'] += cnt
-                if any(k in path for k in GA_CONFIG['web_guide_keyword']):  res['guide'] += cnt
-                if any(k in path for k in GA_CONFIG['web_login_page_keyword']): res['web_login'] += cnt
+            _merge_max(visitors, _web_users_by_host(client, prop_web, date_fmt))
+            try:
+                _merge_max(login_events, _web_login_events_by_host(client, prop_web, date_fmt))
+            except Exception as e:
+                # 덧붙인 열 하나 때문에 기존 웹 지표 전체를 비우지 않는다.
+                login_events_ok = False
+                print(f"   ⚠️ 웹 로그인 이벤트 조회 실패({web_id}) — 해당 열만 빈칸: {str(e)[:200]}")
+            for key, keyword_key in GA_WEB_PAGE_METRICS:
+                _merge_max(page_users[key], _web_users_by_host(
+                    client, prop_web, date_fmt, path_keywords=GA_CONFIG[keyword_key]))
 
-            # 1-3. 웹 호스트 (방문자)
-            req_host = RunReportRequest(
-                property=prop_web,
-                date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-                dimensions=[Dimension(name="hostName")],
-                metrics=[Metric(name="activeUsers")]
-            )
-            for row in client.run_report(req_host).rows:
-                host = row.dimension_values[0].value
-                users = int(row.metric_values[0].value)
-                
-                if any(k in host for k in GA_CONFIG['host_a015']): 
-                    res['a015_user'] += users
-                elif any(k in host for k in GA_CONFIG['host_arreo']): 
-                    res['arreo_user'] += users
+        # 015 웹 MAU (Y열): 기존과 같이 015 속성에서만 읽는다.
+        mau = {}
+        for web_id in GA4_MAU_WEB_IDS:
+            _merge_max(mau, _web_users_by_host(
+                client, f"properties/{web_id}", date_fmt, metric="active28DayUsers"))
 
-            # 1-4. 웹 MAU (015 사이트만 Y열 합산)
-            if web_id == '444980831': # 015 사이트 ID
-                res_mau_web = client.run_report(RunReportRequest(
-                    property=prop_web,
-                    date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-                    metrics=[Metric(name="active28DayUsers")]
-                ))
-                if res_mau_web.rows:
-                    res['mau_015_total'] += int(res_mau_web.rows[0].metric_values[0].value)
+        web = {key: sum(page_users[key].values()) for key, _ in GA_WEB_PAGE_METRICS}
+        web['a015_user'] = sum(c for h, c in visitors.items() if _is_a015_host(h))
+        web['arreo_user'] = sum(
+            c for h, c in visitors.items()
+            if not _is_a015_host(h) and any(k in h for k in GA_CONFIG['host_arreo']))
+        web['mau_015_total'] = sum(c for h, c in mau.items() if _is_a015_host(h))
 
-        except Exception as e:
-            print(f"⚠️ Web ID({web_id}) 조회 중 오류: {e}")
+        # 호스트별 분리 값 (합산 값과 같은 원본에서 나눠 담는다)
+        per_host = dict(page_users, visitors=visitors, mau=mau)
+        for label, needle in GA_HOST_SPLIT:
+            for metric, _ in GA_HOST_METRICS:
+                web[host_key(label, metric)] = sum(
+                    c for h, c in per_host[metric].items() if needle in h)
+            web[host_key(label, 'login_event')] = sum(
+                c for h, c in login_events.items() if needle in h) if login_events_ok else None
+            web[host_key(label, 'dau')] = web[host_key(label, 'visitors')]   # 'mau@호스트'는 위에서 채워짐
 
-    # 2. APP 속성 조회
+        # arreo.com: DAU는 기존 '아레오 방문자'(X열)와 같은 값, MAU는 같은 호스트 기준 28일 사용자
+        mau_all = dict(mau)
+        for web_id in GA4_WEB_IDS:
+            if web_id not in GA4_MAU_WEB_IDS:
+                _merge_max(mau_all, _web_users_by_host(
+                    client, f"properties/{web_id}", date_fmt, metric="active28DayUsers"))
+        web[host_key('arreo.com', 'dau')] = web['arreo_user']
+        web[host_key('arreo.com', 'mau')] = sum(
+            c for h, c in mau_all.items()
+            if not _is_a015_host(h) and any(k in h for k in GA_CONFIG['host_arreo']))
+        res.update(web)
+    except Exception as e:
+        res['errors'].append(f"web: {e}")
+        print(f"⚠️ GA4 웹 조회 실패 — 웹 지표는 빈칸으로 둡니다: {e}")
+
+    # 2. APP
     try:
         prop_app = f"properties/{GA4_APP_ID}"
-
-        # 2-1. 앱 화면 [사용자 수]
-        req_screen = RunReportRequest(
-            property=prop_app,
-            date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-            dimensions=[Dimension(name="unifiedScreenName")],
-            metrics=[Metric(name="activeUsers")] 
-        )
-        for row in client.run_report(req_screen).rows:
-            screen = row.dimension_values[0].value
-            cnt = int(row.metric_values[0].value)
-            if any(k in screen for k in GA_CONFIG['app_signup_keyword']): res['app_signup'] += cnt
-
-        # 2-2. 앱 이벤트 (로그인)
-        req_app_evt = RunReportRequest(
-            property=prop_app,
-            date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-            dimensions=[Dimension(name="eventName")],
-            metrics=[Metric(name="eventCount")]
-        )
-        for row in client.run_report(req_app_evt).rows:
-            if row.dimension_values[0].value == GA_CONFIG['app_login_event_name']:
-                res['app_login'] += int(row.metric_values[0].value)
-
-        # 2-3. 앱 DAU (AK열용)
-        req_app_dau = RunReportRequest(
-            property=prop_app,
-            date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-            metrics=[Metric(name="activeUsers")]
-        )
-        if client.run_report(req_app_dau).rows:
-            res['dau_app'] = int(client.run_report(req_app_dau).rows[0].metric_values[0].value)
-
-        # 2-4. 앱 MAU (AL열용 & Y열 합산용)
-        res_mau_app = client.run_report(RunReportRequest(
-            property=prop_app,
-            date_ranges=[DateRange(start_date=date_fmt, end_date=date_fmt)],
-            metrics=[Metric(name="active28DayUsers")]
-        ))
-        if res_mau_app.rows:
-            mau_app_val = int(res_mau_app.rows[0].metric_values[0].value)
-            res['mau_app'] = mau_app_val         # AL열 (App Only)
-            res['mau_015_total'] += mau_app_val  # Y열 (015 Total)
-
+        app = {
+            # 가입 화면을 본 고유 사용자 (화면별 합산이 아니라 필터로 한 번에)
+            'app_signup': _app_platform_total(_ga_rows(
+                client, prop_app, date_fmt, ["platform"], "activeUsers",
+                ("unifiedScreenName", GA_CONFIG['app_signup_keyword']))),
+            # 로그인 이벤트 횟수 (횟수는 더해도 되는 값)
+            'app_login': sum(
+                cnt for (event_name, platform), cnt in _ga_rows(
+                    client, prop_app, date_fmt, ["eventName", "platform"], "eventCount")
+                if platform in GA_APP_PLATFORMS
+                and event_name == GA_CONFIG['app_login_event_name']),
+            'dau_app': _app_platform_total(_ga_rows(
+                client, prop_app, date_fmt, ["platform"], "activeUsers")),
+            'mau_app': _app_platform_total(_ga_rows(
+                client, prop_app, date_fmt, ["platform"], "active28DayUsers")),
+        }
+        app[host_key('015앱', 'mau')] = app['mau_app']   # AL열과 같은 값
+        app[host_key('015앱', 'dau')] = app['dau_app']   # AK열과 같은 값
+        res.update(app)
     except Exception as e:
-        print(f"⚠️ App ID 조회 중 오류: {e}")
+        res['errors'].append(f"app: {e}")
+        print(f"⚠️ GA4 앱 조회 실패 — 앱 지표는 빈칸으로 둡니다: {e}")
 
     return res
+
+
+# 데이터입력시트에서 GA4 값이 들어가는 열. process_one_day의 행 조립 순서와 같아야 한다.
+GA_INPUT_COLUMNS = [
+    ("P", "web_signup"), ("Q", "app_signup"), ("R", "cash_charge"),
+    ("S", "web_login"), ("T", "app_login"), ("U", "voicemail"), ("V", "guide"),
+    ("W", "a015_user"), ("X", "arreo_user"), ("Y", "mau_015_total"),
+    ("AK", "dau_app"), ("AL", "mau_app"),
+] + [
+    (re.sub(r"\d+", "", rowcol_to_a1(1, GA_HOST_FIRST_COLUMN + i)), key)
+    for i, key in enumerate(GA_HOST_KEYS)
+]
+
+
+def ensure_host_columns(sheet_input):
+    """서비스별 MAU/DAU 열(AU~BB)이 들어갈 자리와 머리글을 준비한다. 이미 있으면 아무것도 안 한다.
+
+    머리글 행은 C열이 '날짜'인 행으로 찾는다. 그 윗행에 서비스 이름, 그 행에 MAU/DAU를 적는다.
+    """
+    if sheet_input.col_count < INPUT_END_COLUMN:
+        sheet_input.add_cols(INPUT_END_COLUMN - sheet_input.col_count)
+
+    head = sheet_input.col_values(3)[:10]
+    header_row = next((i for i, v in enumerate(head, start=1) if str(v).strip() == '날짜'), None)
+    if not header_row or header_row < 2:
+        print("   ⚠️ 머리글 행(C열 '날짜')을 못 찾아 호스트별 머리글은 건너뜁니다.")
+        return
+
+    first = rowcol_to_a1(header_row, GA_HOST_FIRST_COLUMN)
+    if sheet_input.get(rowcol_to_a1(header_row, INPUT_END_COLUMN)):
+        return   # 마지막 열까지 머리글이 있으면 끝
+
+    hosts, metrics = [], []
+    for label in GA_USAGE_GROUPS:
+        hosts.extend([label] + [""] * (len(GA_USAGE_METRICS) - 1))
+        metrics.extend(title for _, title in GA_USAGE_METRICS)
+    sheet_input.update(rowcol_to_a1(header_row - 1, GA_HOST_FIRST_COLUMN), [hosts, metrics],
+                       value_input_option='USER_ENTERED')
+    print(f"   ✅ 서비스별 MAU/DAU 머리글 추가 ({first}~)")
+
+
+def refresh_ga_columns(sheet_input, target_date_obj):
+    """이미 입력된 날짜 행의 GA4 열만 다시 채운다.
+
+    GA4는 하루 치가 확정되기까지 24~48시간이 걸려서, 다음 날 아침에 한 번 읽은 값은
+    실제보다 작다. 며칠 뒤 다시 읽어 덮어쓴다. 조회에 실패한 항목은 건드리지 않는다.
+    """
+    s_date = target_date_obj.strftime('%Y-%m-%d')
+    row = find_input_rows(sheet_input, [target_date_obj])[target_date_obj]
+    if not row:
+        print(f"⏭️  {s_date} GA4 재수집 건너뜀 — 데이터입력시트에 행이 없습니다.")
+        return True
+
+    ensure_host_columns(sheet_input)
+    ga_data = get_ga4_detailed_data(target_date_obj.strftime('%Y%m%d'))
+    updates = [
+        {"range": f"{col}{row}", "values": [[fmt(ga_data[key])]]}
+        for col, key in GA_INPUT_COLUMNS if ga_data[key] is not None
+    ]
+    if updates:
+        sheet_input.batch_update(updates, value_input_option='USER_ENTERED')
+    print(f"   ✅ {s_date} GA4 열 {len(updates)}칸 재수집 ({row}행)")
+    return not ga_data['errors']
 
 # ==============================================================================
 # [함수] 셀에 든 날짜 읽기 (재실행 감지용)
@@ -594,6 +819,9 @@ def process_one_day(target_date_obj):
     yh = get_yh_data(q_date)
     hdb = get_hdb_data(q_date)
     ga_data = get_ga4_detailed_data(q_date)
+    if ga_data['errors']:
+        # DB 수치는 그대로 넣고, 실패한 GA4 칸만 빈칸으로 둔다 (0으로 채우지 않는다).
+        GA_INCOMPLETE_DATES.append(target_date_obj)
 
     if not yh or not hdb:
         print(f"❌ {s_date} 데이터 수집 실패로 건너뜁니다.")
@@ -612,6 +840,7 @@ def process_one_day(target_date_obj):
         # [Sheet 1] 데이터입력시트 -> "처음에 만든 기능 (데이터 입력)"
         # ======================================================================
         print(f"🔹 [{TAB_NAME_INPUT}] 데이터 입력 시작...")
+        ensure_host_columns(sheet_input)
         col_b = sheet_input.col_values(2)
         last_row = len(col_b)
         input_target_row = last_row + 1
@@ -626,12 +855,12 @@ def process_one_day(target_date_obj):
                 "source": { 
                     "sheetId": sheet_input.id, 
                     "startRowIndex": last_row-1, "endRowIndex": last_row, 
-                    "startColumnIndex": 0, "endColumnIndex": 46 
+                    "startColumnIndex": 0, "endColumnIndex": INPUT_END_COLUMN 
                 },
                 "destination": { 
                     "sheetId": sheet_input.id, 
                     "startRowIndex": input_target_row-1, "endRowIndex": input_target_row, 
-                    "startColumnIndex": 0, "endColumnIndex": 46 
+                    "startColumnIndex": 0, "endColumnIndex": INPUT_END_COLUMN 
                 },
                 "pasteType": "PASTE_NORMAL"
             }}]
@@ -683,6 +912,10 @@ def process_one_day(target_date_obj):
         row.extend([fmt(yh["one_to_one_sms"]), fmt(yh["one_to_one_lms"]), fmt(yh["one_to_one_mms"]), fmt(f"=SUM(AM{input_target_row}:AO{input_target_row})")])
         row.extend([fmt(yh['a015_sms']), fmt(yh['a015_lms']), fmt(yh['a015_mms']), fmt(a015_tot)])
 
+        # AU~BB: 서비스별 MAU/DAU (기존 A~AT 레이아웃은 그대로)
+        assert len(row) == INPUT_BASE_COLUMNS, f"기존 열 수가 {INPUT_BASE_COLUMNS}이 아님: {len(row)}"
+        row.extend(fmt(ga_data[key]) for key in GA_HOST_KEYS)
+
         sheet_input.update(f"A{input_target_row}", [row], value_input_option='USER_ENTERED')
         print(f"   ✅ 입력 완료")
 
@@ -733,6 +966,12 @@ def process_one_day(target_date_obj):
         return False
 
 
+def open_input_sheet():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name(JSON_KEY_FILE, scope)
+    return gspread.authorize(creds).open_by_key(SHEET_ID).worksheet(TAB_NAME_INPUT)
+
+
 # ==============================================================================
 # [Main]
 # ==============================================================================
@@ -741,6 +980,10 @@ def main():
     parser.add_argument('--date', type=str, help='특정 날짜 실행 (YYYYMMDD)')
     parser.add_argument('--start', type=str, help='시작 날짜 (YYYYMMDD)')
     parser.add_argument('--end', type=str, help='종료 날짜 (YYYYMMDD)')
+    parser.add_argument('--refresh-ga', action='store_true',
+                        help='행을 추가하지 않고 지정한 날짜의 GA4 열만 다시 채움 (--date 또는 --start/--end 필요)')
+    parser.add_argument('--no-ga-refresh', action='store_true',
+                        help=f'기본 실행 때 직전 {GA_REFRESH_DAYS}일의 GA4 재수집을 생략')
     
     args = parser.parse_args()
 
@@ -749,6 +992,7 @@ def main():
     
     start_date = None
     end_date = None
+    daily_run = not args.date and not (args.start and args.end)
 
     if args.date:
         try:
@@ -766,12 +1010,49 @@ def main():
 
     print(f"🚀 봇 실행 범위: {start_date} ~ {end_date}")
 
+    # GA4 열만 다시 채우는 모드 (행 추가/보고양식 갱신 없음)
+    if args.refresh_ga:
+        if daily_run:
+            print("❌ --refresh-ga 는 --date 또는 --start/--end 와 함께 써야 합니다."); return
+        sheet_input = open_input_sheet()
+        failed = []
+        curr = start_date
+        while curr <= end_date:
+            if not refresh_ga_columns(sheet_input, curr):
+                failed.append(curr)
+            curr += timedelta(days=1)
+        if failed:
+            print(f"\n❌ GA4 재수집 실패 {len(failed)}건: {[str(d) for d in failed]}")
+            sys.exit(1)
+        print("\n🎉 GA4 재수집이 끝났습니다.")
+        return
+
     failed = []
     curr = start_date
     while curr <= end_date:
         if not process_one_day(curr):
             failed.append(curr)
         curr += timedelta(days=1)
+
+    # 기본(어제) 실행이면, 그 앞 며칠의 GA4 값을 확정치로 다시 채운다.
+    if daily_run and not args.no_ga_refresh and GA_REFRESH_DAYS > 0:
+        print(f"\n🔄 직전 {GA_REFRESH_DAYS}일 GA4 재수집...")
+        try:
+            sheet_input = open_input_sheet()
+            for i in range(1, GA_REFRESH_DAYS + 1):
+                past = start_date - timedelta(days=i)
+                if not refresh_ga_columns(sheet_input, past):
+                    GA_INCOMPLETE_DATES.append(past)
+        except Exception:
+            print("❌ GA4 재수집 중 오류:")
+            traceback.print_exc()
+            failed.append("GA4 재수집")
+
+    if GA_INCOMPLETE_DATES:
+        days = sorted({str(d) for d in GA_INCOMPLETE_DATES})
+        print(f"\n⚠️ GA4 조회가 일부 실패한 날짜 {len(days)}건: {days}")
+        print("    해당 칸은 빈칸입니다. `python main.py --refresh-ga --date YYYYMMDD` 로 다시 채우세요.")
+        failed.extend(days)
 
     if failed:
         # cron/모니터링이 실패를 감지하려면 종료 코드가 0이 아니어야 한다.

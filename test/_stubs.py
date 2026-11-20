@@ -38,6 +38,9 @@ def install():
         ("google.analytics.data_v1beta.types", "DateRange"),
         ("google.analytics.data_v1beta.types", "Metric"),
         ("google.analytics.data_v1beta.types", "Dimension"),
+        ("google.analytics.data_v1beta.types", "Filter"),
+        ("google.analytics.data_v1beta.types", "FilterExpression"),
+        ("google.analytics.data_v1beta.types", "FilterExpressionList"),
     ):
         setattr(sys.modules[name], attr, object)
 
